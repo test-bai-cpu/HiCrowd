@@ -7,7 +7,7 @@
 
 Yufei Zhu, Shih-Min Yang, Martin Magnusson, Allan Wang
 
-- Paper: [ICRA26_HiCrowd.pdf](ICRA26_HiCrowd.pdf)
+- [Paper (arXiv:2602.05608)](https://arxiv.org/abs/2602.05608)
 
 # environment setup
 
@@ -121,6 +121,8 @@ Pre-trained checkpoints are provided under `rl_checkpoints/`. Pass the checkpoin
 
 
 # run
+
+Example commands are provided in `run.sh`. Below are the basic usage examples.
 
 **Training:**
 ```bash
