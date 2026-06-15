@@ -1,0 +1,227 @@
+import os, sys
+import csv
+import logging
+import yaml
+import numpy as np
+import random
+import math
+import pickle
+import time
+
+from config import get_args, check_args
+from sim.simulator import Simulator
+from controller.group_linear_mpc import GroupLinearMPC
+from controller import mpc_utils
+from obs_data_parser import ObsDataParser
+from main_utils import set_random_seed, preprocess_rl_obs
+
+#### RL model
+import torch
+from torch.utils.tensorboard import SummaryWriter
+from rl.rl_agent import SAC
+from rl.trainer import ContinuousSACTrainer
+from rl.utils import load_config
+#### -----------------------------------
+
+
+if __name__ == "__main__":
+    args = get_args()
+    
+    if args.dataset_name == "syn":
+        args.dset_file = "dataset/scenarios/datasets_syn.yaml"
+    elif args.dataset_name == "eth":
+        args.dset_file = "dataset/scenarios/datasets_eth.yaml"
+
+    
+    os.makedirs(args.output_dir, exist_ok=True)
+        
+    mpc_config = mpc_utils.parse_config_file("config_files/main_config.yaml")
+    rl_config = load_config("config_files/rl_config.yaml")
+
+    log_fname = os.path.join(args.output_dir, 'experiment.log')
+    file_handler = logging.FileHandler(log_fname, mode='w')
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    level = logging.INFO
+    logging.basicConfig(level=level, handlers=[stdout_handler, file_handler],
+						format='%(asctime)s, %(levelname)s: %(message)s', datefmt="%Y-%m-%d %H:%M:%S")
+    logger = logging.getLogger(__name__)
+    logging.getLogger('matplotlib').setLevel(logging.WARNING)
+    logging.getLogger('numba').setLevel(logging.WARNING)
+    logging.getLogger('byteflow').setLevel(logging.WARNING)
+
+    check_args(args, logger)
+    
+    # add config from mpc to args, include collison radius and goal radius and dt
+    args.collision_radius = mpc_config.getfloat('simulator', 'collision_radius')
+    args.goal_radius = mpc_config.getfloat('simulator', 'goal_radius')
+    args.dt = mpc_config.getfloat('simulator', 'dt')
+    args.fps = 1 / args.dt
+    args.future_steps = mpc_config.getint('simulator', 'future_steps')
+    args.time_horizon = args.dt * args.future_steps
+    args.max_speed = mpc_config.getfloat('simulator', 'max_speed')
+    args.seed = mpc_config.getint('simulator', 'seed')
+    args.follow_weight = mpc_config.getfloat('method', 'follow_weight')
+
+    set_random_seed(args.seed)
+    
+    # which datasets to preload
+    yaml_stream = open(args.dset_file, "r")
+    yaml_dict = yaml.safe_load(yaml_stream)
+    dsets = yaml_dict["datasets"]
+    flags = yaml_dict["flags"]
+    if not len(dsets) == len(flags):
+        logger.error("datasets file - number of datasets and flags are not equal!")
+        raise Exception("datasets file - number of datasets and flags are not equal!")
+
+    envs_arg = []
+    for i in range(len(dsets)):
+        dset = dsets[i]
+        flag = flags[i]
+        envs_arg.append((dset, flag))
+    args.envs = envs_arg
+
+    ########## Setup Simulator and initialze result file ############
+    if args.dataset_name == "eth":
+        data_file = "eth_ucy_train"
+    elif args.dataset_name == "syn":
+        data_file = "synthetic_train"
+
+    sim = Simulator(args, f"dataset/scenarios/{data_file}.json", logger)
+    os.makedirs(os.path.join(sim.output_dir, "evas"), exist_ok=True)
+    eva_res_dir = os.path.join(sim.output_dir, "evas", f"{data_file}_{args.exp_name}.csv")
+    headers = [
+        "case_id", "start_frame", "success", "fail_reason", "navigation_time", "path_length",
+        "path_smoothness", "motion_smoothness", "min_ped_dist", "avg_ped_dist"
+    ]
+    with open(eva_res_dir, mode='w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(headers)  # Write the header row
+    ########################################################################
+
+    ######################### RL model #####################################
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    result_dir = f"{args.output_dir}/rl_results"
+    os.makedirs(result_dir, exist_ok=True)
+    
+    # rl state shape is computed by 4 * max_humans + 4 (for goal pos and goal vx, vy)
+    rl_state_shape = [4 * mpc_config.getint('mpc_env', 'max_humans') + 4]
+    rl_agent = SAC(rl_state_shape, rl_config["action_shape"],
+                   rl_config["latent_dim"], device)
+    rl_config["state_shape"] = rl_state_shape
+    rl_trainer = ContinuousSACTrainer(rl_agent, result_dir, rl_config)
+    train_info = {}
+
+    tb_writer = SummaryWriter(f"logs/{args.exp_name}/{int(time.time())}")
+    logger.info(f"RL result directory: {result_dir}")
+    ########################################################################
+
+    np.random.shuffle(sim.case_id_list)
+    
+    obs_data_parser = ObsDataParser(mpc_config, args)
+
+    max_follow_pos_delta = (mpc_config.getint('mpc_env', 'mpc_horizon') * args.max_speed)
+
+    # for case_id in sim.case_id_list:
+    while True: # we keep sample from case id list for training.
+        case_id = random.choice(sim.case_id_list)
+        sim.logger.info(f"Now in the case id: {case_id}")
+        obs = sim.reset(case_id)
+        sim.robot_speed = args.max_speed
+        done = False
+        mpc = GroupLinearMPC(mpc_config, args, logger) # MPC initialization
+
+        time_step = 0
+        while not done:
+            current_state, target, robot_speed, robot_motion_angle = obs_data_parser.get_robot_state(obs)
+            robot_vx = robot_speed * np.cos(robot_motion_angle)
+            robot_vy = robot_speed * np.sin(robot_motion_angle)
+            nearby_human_state = obs_data_parser.get_human_state(obs) ## padding to max_humans, padding with 1e6 (for pos and vel). Human_state is (n, 4): pos_x, pos_y, vel_x, vel_y
+
+            ###################### RL model output the follow_pos ##################
+            rl_trainer.global_step += 1
+            rl_obs = preprocess_rl_obs(nearby_human_state, current_state, robot_vx, robot_vy, sim.goal_pos)
+            if rl_trainer.is_learning_starts():
+                rl_actions, _, entropies = rl_agent.get_action(torch.FloatTensor(rl_obs).to(device))
+                rl_actions = rl_actions.cpu().detach().numpy()
+            else:
+                rl_actions = rl_agent.random_actions()
+
+            ##### Re-format actions. rl_actions is (1, 4): pos_x, pos_y, vel_x, vel_y, and they are all relative values to the robot, both pos and vel ######
+            follow_pos = rl_actions[0, :2].copy()
+            follow_pos = follow_pos * max_follow_pos_delta  # re-range the follow_pos and follow_vel
+            follow_pos = follow_pos + current_state[:2] # revert the relative pos to global pos
+            follow_state = np.array([follow_pos[0], follow_pos[1], 0, 0])
+            follow_state = follow_state.reshape(1, -1)
+            #########################################################
+
+            for mpc_steps_in_one_follow_state in range(10):
+                action_mpc = mpc.get_action(obs, target, follow_state) # MPC generate action
+
+                obs, reward, done, info, time_step, info_dict = sim.step(action_mpc, follow_state)
+                if done == True:
+                    break
+
+            #################### RL model update and save #############################
+            current_state, target, robot_speed, robot_motion_angle = obs_data_parser.get_robot_state(obs)
+            robot_vx = robot_speed * np.cos(robot_motion_angle)
+            robot_vy = robot_speed * np.sin(robot_motion_angle)
+            next_nearby_human_state = obs_data_parser.get_human_state(obs) ## padding to max_humans, padding with 0 (for pos and vel). Human_state is (n, 4): pos_x, pos_y, vel_x, vel_y
+
+            next_rl_obs = preprocess_rl_obs(next_nearby_human_state, current_state, robot_vx, robot_vy, sim.goal_pos)
+
+            rl_reward = np.array([reward])
+            rl_done = np.array([done])
+            rl_trainer.add_to_buffer(rl_obs, next_rl_obs, rl_actions, rl_reward, rl_done, [{}])
+            rl_trainer.update_episode_info(rl_reward)
+            if "reach_goal_reward" in info_dict:
+                rl_trainer.reporter["reach_goal_reward"].append(info_dict["reach_goal_reward"])
+                rl_trainer.reporter["reach_goal_reward_dense"].append(info_dict["reach_goal_reward_dense"])
+                rl_trainer.reporter["group_matching_reward"].append(info_dict["group_matching_reward"])
+
+            if rl_done.any():
+                rl_infos = {"is_success": np.array([info_dict["reach_goal_reward"] > 0])}   # info is a boolean value representing whether the robot reaches the target
+                rl_trainer.record_episode_info(rl_done, rl_infos)
+
+            if rl_trainer.is_train_model():
+                train_info = rl_trainer.train_model()
+
+            rl_trainer.report_progress(tb_writer, train_info)
+            rl_trainer.save_model()
+            #################################################################################
+
+        ################# save the robot path and human path #############################
+        # save_filename = f"{data_file}_{args.exp_name}.pkl"
+        # save_filepath = os.path.join(sim.output_dir, "evas", save_filename)
+        
+        # existing_data = {}
+        # if os.path.exists(save_filepath):
+        #     try:
+        #         with open(save_filepath, "rb") as f:
+        #             existing_data = pickle.load(f)
+        #     except (pickle.UnpicklingError, EOFError):
+        #         existing_data = {}
+        
+        # existing_data[case_id] = sim.save_all_traj.copy()
+        
+        # with open(save_filepath, "wb") as f:
+        #     pickle.dump(existing_data, f)
+        #     logger.info(f"Case {case_id} trajectory appended to {save_filepath}")
+        #################################################################################
+
+        ############## save the evaluation results to the csv file ##############
+        result_dict = sim.evaluate(output=True)
+        with open(eva_res_dir, mode='a', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow([
+                case_id,
+                sim.start_frame,
+                result_dict["success"],
+                result_dict["fail_reason"],
+                result_dict["navigation_time"],
+                result_dict["path_length"],
+                result_dict["path_smoothness"],
+                result_dict["motion_smoothness"],
+                result_dict["min_ped_dist"],
+                result_dict["avg_ped_dist"],
+                ])  # Write the header row
+        #########################################################################

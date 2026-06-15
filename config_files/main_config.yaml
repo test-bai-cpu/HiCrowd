@@ -1,0 +1,74 @@
+simulator:
+  # in navigation smaller than this means collision
+  collision_radius: 0.5
+
+  # in navigation smaller than this means goal reached
+  goal_radius: 0.5
+
+  # simulation time step
+  dt: 0.1
+
+  # maximum robot speed (avg human walking speed)
+  max_speed: 1.0
+
+  # random seed
+  seed: 42
+
+  # number of future time steps to predict
+  future_steps: 8
+
+
+method:
+  # reward weight for following the group
+  follow_weight: 1.0
+
+
+mpc_env:
+
+  # robot maximum rotation in one time-step in degrees
+  max_rot_degrees: 3.14
+
+  # mpc pred horizon for each MPC solve step
+  mpc_horizon: 10
+
+  # max humans predefined for casadi parameter
+  max_humans: 10
+
+  # max distance for robot observation
+  max_human_distance: 5
+
+  # max humans predefined for casadi parameter
+  max_human_groups: 20
+
+  # used when checking whether to follow a group when it is closer to goal
+  group_target_threshold: 0.3
+
+  # used when checking which ones are nearby groups
+  group_robot_threshold: 3
+
+  # used to check whether group is static or moving
+  group_vel_threshold: 0.2
+
+  # weight for goal cost
+  w_goal: 1.0
+
+  # weight for safety cost
+  w_safe: 1.0
+
+  # weight for following group
+  w_follow: 1.0
+
+  # weight for smooth traj cost
+  w_smooth: 1.0
+
+  # number of general direction rollouts for MPC
+  num_directions: 12
+
+  # number of general direction rollouts for MPC
+  num_linear: 10
+
+  # number of general direction rollouts for MPC
+  num_angular: 10
+
+  # discount factor for cost estimation
+  gamma: 0.9
